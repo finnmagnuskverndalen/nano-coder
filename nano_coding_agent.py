@@ -52,6 +52,9 @@ HELP_TEXT = textwrap.dedent("""\
     /session       Show path to current session file
     /tools         List active tools with risk level
     /mode          Toggle between Ask and Auto-Accept mode
+    /model         Show current model
+    /model <name>  Switch to a different Ollama model
+    /models        List locally installed Ollama models
     /steps         Show current step limit
     /steps <n>     Set step limit  e.g. /steps 10
     /reset         Clear session history and memory
@@ -331,12 +334,19 @@ class TerminalRenderer:
     def set_approval(self, policy: str) -> None:
         self.approval_policy = policy
 
+    def set_model(self, model: str) -> None:
+        self.model = model
+
     def announce_mode_change(self, policy: str) -> None:
         if policy == "auto":
             label = "AUTO-ACCEPT — all tools run without confirmation"
         else:
             label = "ASK — risky tools require confirmation"
         print(f"\n  {C_INVERT} MODE {C_RESET}  {C_MID}{label}{C_RESET}\n")
+
+    def announce_model_change(self, old: str, new: str) -> None:
+        print(f"\n  {C_INVERT} MODEL {C_RESET}  "
+              f"{C_DIM}{old}{C_RESET} → {C_BRIGHT}{new}{C_RESET}\n")
 
     def start_turn(self) -> None:
         with self._lock:
@@ -544,6 +554,24 @@ class OllamaModelClient:
         self.timeout     = timeout
         self.num_ctx     = num_ctx
 
+    def set_model(self, model: str) -> None:
+        """Switch the active model. Caller is responsible for validating it exists."""
+        self.model = model
+
+    def list_local_models(self) -> list[str]:
+        """Return sorted names of models installed locally (via Ollama /api/tags)."""
+        req = urllib.request.Request(
+            self.host + "/api/tags",
+            headers={"Content-Type": "application/json"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Cannot reach Ollama at {self.host}") from exc
+        return sorted(m["name"] for m in data.get("models", []) if "name" in m)
+
     def _payload(self, prompt: str, max_new_tokens: int, stream: bool) -> bytes:
         return json.dumps({
             "model": self.model, "prompt": prompt, "stream": stream,
@@ -609,6 +637,13 @@ class FakeModelClient:
     def __init__(self, outputs: list[str]):
         self.outputs: list[str] = list(outputs)
         self.prompts: list[str] = []
+        self.model = "fake"
+
+    def set_model(self, model: str) -> None:
+        self.model = model
+
+    def list_local_models(self) -> list[str]:
+        return ["fake"]
 
     def complete(self, prompt: str, max_new_tokens: int) -> str:
         self.prompts.append(prompt)
@@ -874,6 +909,18 @@ class NanoAgent:
 
     def set_max_steps(self, n: int) -> None:
         self.max_steps = max(1, n)
+
+    def set_model(self, model: str) -> None:
+        """Switch the underlying model on both the client and the renderer header."""
+        if not hasattr(self.model_client, "set_model"):
+            raise RuntimeError("This model client does not support switching.")
+        self.model_client.set_model(model)
+        self.renderer.set_model(model)
+
+    def list_local_models(self) -> list[str]:
+        if not hasattr(self.model_client, "list_local_models"):
+            raise RuntimeError("This model client does not support listing models.")
+        return self.model_client.list_local_models()
 
     def reset(self) -> None:
         self.session["history"] = []
@@ -1219,6 +1266,75 @@ def _new_session_id() -> str:
 
 
 # ─────────────────────────────────────────────
+# REPL command handlers
+# ─────────────────────────────────────────────
+
+def _cmd_models(agent: "NanoAgent") -> None:
+    """List locally installed Ollama models, marking the current one."""
+    try:
+        models = agent.list_local_models()
+    except RuntimeError as exc:
+        print(f"  {C_ERROR}{exc}{C_RESET}")
+        return
+    if not models:
+        print(f"  {C_DIM}no models installed — try:{C_RESET} "
+              f"{C_BRIGHT}ollama pull qwen2.5-coder:1.5b{C_RESET}")
+        return
+    current = agent.model_client.model
+    print(f"\n  {C_BOLD}Installed Ollama models:{C_RESET}")
+    for m in models:
+        marker = f"{C_BRIGHT}●{C_RESET}" if m == current else " "
+        label  = f"{C_BRIGHT}{m}{C_RESET}" if m == current else f"{C_MID}{m}{C_RESET}"
+        print(f"   {marker} {label}")
+    print(f"\n  {C_DIM}switch with:{C_RESET} /model <name>\n")
+
+
+def _cmd_model(agent: "NanoAgent", user_input: str) -> None:
+    """`/model` shows current; `/model <name>` switches."""
+    parts = user_input.split(maxsplit=1)
+    if len(parts) == 1:
+        print(f"  {C_DIM}current model:{C_RESET} "
+              f"{C_BRIGHT}{agent.model_client.model}{C_RESET}")
+        print(f"  {C_DIM}usage:{C_RESET} /model <name>   "
+              f"{C_DIM}(try /models to list installed){C_RESET}")
+        return
+
+    new_model = parts[1].strip()
+    if not new_model:
+        print(f"  {C_DIM}usage: /model <name>{C_RESET}")
+        return
+
+    old = agent.model_client.model
+    if new_model == old:
+        print(f"  {C_DIM}already using{C_RESET} {C_BRIGHT}{new_model}{C_RESET}")
+        return
+
+    # Verify the model is installed locally before switching
+    try:
+        available = agent.list_local_models()
+    except RuntimeError as exc:
+        print(f"  {C_ERROR}{exc}{C_RESET}")
+        return
+
+    if new_model not in available:
+        print(f"  {C_ERROR}model '{new_model}' not found locally{C_RESET}")
+        print(f"  {C_DIM}pull it first:{C_RESET} "
+              f"{C_BRIGHT}ollama pull {new_model}{C_RESET}")
+        if available:
+            shown = ", ".join(available[:6])
+            more  = f" (+{len(available) - 6} more)" if len(available) > 6 else ""
+            print(f"  {C_DIM}or pick from:{C_RESET} {shown}{more}")
+        return
+
+    try:
+        agent.set_model(new_model)
+    except RuntimeError as exc:
+        print(f"  {C_ERROR}{exc}{C_RESET}")
+        return
+    agent.renderer.announce_model_change(old, new_model)
+
+
+# ─────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────
 
@@ -1331,6 +1447,10 @@ def main(argv: list[str] | None = None) -> int:
             new_policy = "auto" if agent.approval_policy == "ask" else "ask"
             agent.set_approval(new_policy)
             renderer.announce_mode_change(new_policy); continue
+        if user_input == "/models":
+            _cmd_models(agent); continue
+        if user_input == "/model" or user_input.startswith("/model "):
+            _cmd_model(agent, user_input); continue
         if user_input == "/steps" or user_input.startswith("/steps "):
             parts = user_input.split(maxsplit=1)
             if len(parts) == 1:
