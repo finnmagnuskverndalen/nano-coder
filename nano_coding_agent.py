@@ -47,13 +47,15 @@ IGNORED_DIRS = {".git", ".nano-coding-agent", "__pycache__", ".pytest_cache",
 
 HELP_TEXT = textwrap.dedent("""\
   Commands:
-    /help     Show this help message
-    /memory   Show distilled session memory
-    /session  Show path to current session file
-    /tools    List available tools
-    /mode     Toggle between Ask and Auto-Accept mode
-    /reset    Clear session history and memory
-    /exit     Exit the agent
+    /help          Show this help message
+    /memory        Show distilled session memory
+    /session       Show path to current session file
+    /tools         List active tools with risk level
+    /mode          Toggle between Ask and Auto-Accept mode
+    /steps         Show current step limit
+    /steps <n>     Set step limit  e.g. /steps 10
+    /reset         Clear session history and memory
+    /exit          Exit the agent
 """).rstrip()
 
 # ─────────────────────────────────────────────
@@ -404,12 +406,13 @@ class TerminalRenderer:
         else:
             print(f"{C_ERROR}{msg}{C_RESET}", file=sys.stderr)
 
-    def prompt_line(self, session_id: str) -> str:
+    def prompt_line(self, session_id: str, max_steps: int = DEFAULT_MAX_STEPS) -> str:
         badge = self._mode_badge()
         sid   = session_id[:10]
         return (
             f"\n{C_DIM}[{sid}]{C_RESET} "
             f"{badge} "
+            f"{C_DIM}steps:{C_RESET}{C_MID}{max_steps}{C_RESET} "
             f"{C_BRIGHT}nano-coder{C_RESET} "
             f"{C_DIM}>{C_RESET} "
         )
@@ -869,6 +872,9 @@ class NanoAgent:
         self.approval_policy = policy
         self.renderer.set_approval(policy)
 
+    def set_max_steps(self, n: int) -> None:
+        self.max_steps = max(1, n)
+
     def reset(self) -> None:
         self.session["history"] = []
         self.session["memory"]  = {"task": "", "files": [], "notes": []}
@@ -1280,7 +1286,7 @@ def main(argv: list[str] | None = None) -> int:
     # Interactive REPL
     while True:
         try:
-            raw = input(renderer.prompt_line(agent.session["id"]))
+            raw = input(renderer.prompt_line(agent.session["id"], agent.max_steps))
         except (EOFError, KeyboardInterrupt):
             print("")
             return 0
@@ -1305,6 +1311,22 @@ def main(argv: list[str] | None = None) -> int:
             new_policy = "auto" if agent.approval_policy == "ask" else "ask"
             agent.set_approval(new_policy)
             renderer.announce_mode_change(new_policy); continue
+        if user_input == "/steps" or user_input.startswith("/steps "):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) == 1:
+                print(f"  {C_DIM}step limit:{C_RESET} {C_BRIGHT}{agent.max_steps}{C_RESET}"
+                      f"  {C_DIM}(set with /steps <n>){C_RESET}")
+            else:
+                raw_n = parts[1].strip()
+                try:
+                    n = int(raw_n)
+                    if n < 1:
+                        raise ValueError
+                    agent.set_max_steps(n)
+                    print(f"  {C_DIM}step limit set to{C_RESET} {C_BRIGHT}{n}{C_RESET}")
+                except ValueError:
+                    print(f"  {C_DIM}usage: /steps <number>  e.g. /steps 10{C_RESET}")
+            continue
         if user_input.startswith("/"):
             print(f"  {C_DIM}Unknown command. /help for list.{C_RESET}"); continue
 
