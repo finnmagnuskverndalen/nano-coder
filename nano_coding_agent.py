@@ -32,6 +32,10 @@ DEFAULT_MAX_STEPS      = 5
 DEFAULT_MAX_NEW_TOKENS = 384
 DEFAULT_TEMPERATURE    = 0.1
 DEFAULT_TOP_P          = 0.9
+# Ollama defaults to only 2048 tokens context.
+# qwen2.5-coder (all sizes) is trained for 32K — set num_ctx accordingly.
+# 16K is a good balance: fits on 8GB RAM, gives the agent a real working window.
+DEFAULT_NUM_CTX = 16384
 
 MAX_TOOL_OUTPUT        = 2000
 MAX_HISTORY            = 8000
@@ -102,14 +106,26 @@ def is_tty() -> bool:
 # ─────────────────────────────────────────────
 
 def cowsay_logo(message: str = "nano-coder") -> list[str]:
-    """Returns lines for a cowsay speech-bubble with a cow."""
-    pad   = 2
-    width = max(len(message) + pad * 2 + 2, 22)
-    top   = " " + "_" * width
-    mid   = f"< {message.center(width - 2)} >"
-    bot   = " " + "-" * width
+    """
+    Returns lines matching real cowsay output format:
+     _____________
+    < nano-coder  >
+     -------------
+            \\   ^__^
+             \\  (oo)\\_______
+                (__)\\       )\\/\\
+                    ||----w |
+                    ||     ||
+    """
+    inner  = max(len(message), 14)     # minimum bubble content width
+    dashes = inner + 2                 # total underscores / dashes
+    top    = " " + "_" * dashes
+    mid    = f"< {message:<{inner}} >"  # left-aligned, padded to inner width
+    bot    = " " + "-" * dashes
     return [
-        top, mid, bot,
+        top,
+        mid,
+        bot,
         r"        \   ^__^",
         r"         \  (oo)\_______",
         r"            (__)\       )\/\ ",
@@ -275,7 +291,8 @@ class TerminalRenderer:
 
     # ── public API ──────────────────────────────────────────────
 
-    def print_welcome(self, workspace_cwd: str, branch: str, session_id: str) -> None:
+    def print_welcome(self, workspace_cwd: str, branch: str,
+                      session_id: str, num_ctx: int = DEFAULT_NUM_CTX) -> None:
         w     = term_width()
         inner = w - 2
 
@@ -295,8 +312,9 @@ class TerminalRenderer:
             lines.append(center(f"{C_MID}{cow_line}{C_RESET}"))
         lines.append(f"{C_DIM}{'─' * w}{C_RESET}")
         lines.append("  " + kv("workspace", workspace_cwd, inner - 2))
-        lines.append("  " + kv("model",   self.model,  col) + "    " + kv("branch",  branch,        col))
-        lines.append("  " + kv("session", session_id[:28], col) + "    " + kv("mode", self._mode_label(), col))
+        lines.append("  " + kv("model",   self.model,         col) + "    " + kv("branch",  branch,          col))
+        lines.append("  " + kv("ctx",     f"{num_ctx:,} tokens", col) + "    " + kv("mode", self._mode_label(), col))
+        lines.append("  " + kv("session", session_id[:28],    col))
         lines.append(f"{C_DIM}{'═' * w}{C_RESET}")
         print("\n".join(lines))
 
@@ -515,19 +533,24 @@ class SessionStore:
 
 class OllamaModelClient:
     def __init__(self, model: str, host: str, temperature: float,
-                 top_p: float, timeout: int):
+                 top_p: float, timeout: int, num_ctx: int = DEFAULT_NUM_CTX):
         self.model       = model
         self.host        = host.rstrip("/")
         self.temperature = temperature
         self.top_p       = top_p
         self.timeout     = timeout
+        self.num_ctx     = num_ctx
 
     def _payload(self, prompt: str, max_new_tokens: int, stream: bool) -> bytes:
         return json.dumps({
             "model": self.model, "prompt": prompt, "stream": stream,
             "raw": False, "think": False,
-            "options": {"num_predict": max_new_tokens,
-                        "temperature": self.temperature, "top_p": self.top_p},
+            "options": {
+                "num_predict": max_new_tokens,
+                "num_ctx":     self.num_ctx,    # override Ollama's 2048 default
+                "temperature": self.temperature,
+                "top_p":       self.top_p,
+            },
         }).encode("utf-8")
 
     def complete(self, prompt: str, max_new_tokens: int) -> str:
@@ -1189,6 +1212,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="ask = confirm risky tools  |  auto = fully autonomous.")
     p.add_argument("--max-steps",      type=int,   default=DEFAULT_MAX_STEPS)
     p.add_argument("--max-new-tokens", type=int,   default=DEFAULT_MAX_NEW_TOKENS)
+    p.add_argument("--num-ctx",        type=int,   default=DEFAULT_NUM_CTX,
+                   help="Context window tokens sent to Ollama (model max: 32K for qwen2.5-coder).")
     p.add_argument("--temperature",    type=float, default=DEFAULT_TEMPERATURE)
     p.add_argument("--top-p",          type=float, default=DEFAULT_TOP_P)
     p.add_argument("--tool-set",       choices=("core", "full"), default="core")
@@ -1206,7 +1231,8 @@ def build_agent(args: argparse.Namespace, cwd: str,
     store     = SessionStore(Path(workspace.repo_root) / ".nano-coding-agent" / "sessions")
     client    = OllamaModelClient(
         model=args.model, host=args.host,
-        temperature=args.temperature, top_p=args.top_p, timeout=args.ollama_timeout,
+        temperature=args.temperature, top_p=args.top_p,
+        timeout=args.ollama_timeout, num_ctx=args.num_ctx,
     )
     policy = _mode_to_policy(args.mode)
     kwargs = dict(model_client=client, workspace=workspace, session_store=store,
@@ -1231,11 +1257,13 @@ def main(argv: list[str] | None = None) -> int:
     renderer = TerminalRenderer(model=args.model, use_stream=not args.no_stream,
                                 approval_policy=policy)
     agent    = build_agent(args, cwd, renderer)
+    ws = WorkspaceContext.build(cwd)
 
     renderer.print_welcome(
-        workspace_cwd=WorkspaceContext.build(cwd).cwd,
-        branch=WorkspaceContext.build(cwd).branch,
+        workspace_cwd=ws.cwd,
+        branch=ws.branch,
         session_id=agent.session["id"],
+        num_ctx=args.num_ctx,
     )
 
     # One-shot
