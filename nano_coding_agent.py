@@ -1037,7 +1037,10 @@ class NanoAgent:
             r = f"error: bad args for {name}: {exc}"
             self.renderer.write_tool_result(r); return r
         if self._is_repeated(name, args):
-            r = f"error: repeated call to {name} — try something different"
+            path_hint = f" '{args.get('path')}'" if args.get("path") else ""
+            r = (f"error: {name}{path_hint} was already called with the same arguments. "
+                 f"The file is already written. Stop repeating — use <final> to report what you did, "
+                 f"or call a different tool.")
             self.renderer.write_tool_result(r); return r
         if tool["risky"] and not self._approve(name, args):
             r = f"error: approval denied for {name}"
@@ -1094,7 +1097,22 @@ class NanoAgent:
 
     def _is_repeated(self, name: str, args: dict) -> bool:
         evts = [e for e in self.session["history"] if e["role"] == "tool"]
-        return len(evts) >= 2 and all(e["name"] == name and e["args"] == args for e in evts[-2:])
+        if not evts:
+            return False
+        # Case 1: exact same call twice in a row
+        if len(evts) >= 2 and all(e["name"] == name and e["args"] == args for e in evts[-2:]):
+            return True
+        # Case 2: same tool on same path called 2+ times in last 4 tool events
+        # (catches write_file loops where content differs slightly each time)
+        if name in {"write_file", "patch_file", "read_file"} and args.get("path"):
+            path = args["path"]
+            recent_same_path = [
+                e for e in evts[-4:]
+                if e["name"] == name and e["args"].get("path") == path
+            ]
+            if len(recent_same_path) >= 2:
+                return True
+        return False
 
     def _approve(self, name: str, args: dict) -> bool:
         if self.approval_policy == "auto":  return True
@@ -1142,7 +1160,8 @@ class NanoAgent:
         content = str(args["content"])
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-        return f"wrote {path.relative_to(self.root)} ({len(content)} chars)"
+        rel = path.relative_to(self.root)
+        return f"OK: wrote {rel} ({len(content)} chars). File is saved. Do not write {rel} again."
 
     def _tool_run_shell(self, args: dict) -> str:
         r = subprocess.run(str(args["command"]).strip(), cwd=self.root, shell=True,
@@ -1177,7 +1196,8 @@ class NanoAgent:
         text = path.read_text(encoding="utf-8")
         path.write_text(text.replace(str(args["old_text"]), str(args["new_text"]), 1),
                         encoding="utf-8")
-        return f"patched {path.relative_to(self.root)}"
+        rel = path.relative_to(self.root)
+        return f"OK: patched {rel}. File is saved. Do not patch the same block again."
 
     def _record(self, item: dict) -> None:
         self.session["history"].append(item)
