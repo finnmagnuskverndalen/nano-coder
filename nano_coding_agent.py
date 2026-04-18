@@ -8,6 +8,7 @@ Requires: Python 3.10+, Ollama running locally.
 """
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -57,6 +58,7 @@ HELP_TEXT = textwrap.dedent("""\
     /models        List locally installed Ollama models
     /steps         Show current step limit
     /steps <n>     Set step limit  e.g. /steps 10
+    /undo          Revert the last file write or patch
     /reset         Clear session history and memory
     /exit          Exit the agent
 """).rstrip()
@@ -171,6 +173,93 @@ def remember(bucket: list, item: str, limit: int) -> None:
         bucket.remove(item)
     bucket.append(item)
     del bucket[:-limit]
+
+
+def _render_diff(old: str, new: str, label: str, max_lines: int = 20) -> str:
+    """
+    Return a colored unified diff for display above the approval prompt.
+    Trims to max_lines with a "(N more lines)" marker so long diffs don't
+    blow out the terminal. Uses the file's greyscale palette: additions
+    bright, deletions dim, hunk headers faint.
+    """
+    old_lines = old.splitlines(keepends=True) if old else []
+    new_lines = new.splitlines(keepends=True) if new else []
+    raw = list(difflib.unified_diff(old_lines, new_lines, n=2, lineterm=""))
+    header = f"  {C_DIM}── {label} ──{C_RESET}"
+    if not raw:
+        return header + f"\n  {C_DIM}(no changes){C_RESET}"
+
+    # Skip the first two header lines (---/+++); the label replaces them.
+    body = [ln.rstrip("\n") for ln in raw if not ln.startswith(("---", "+++"))]
+    shown, overflow = body[:max_lines], max(0, len(body) - max_lines)
+
+    out = [header]
+    for ln in shown:
+        if ln.startswith("@@"):
+            out.append(f"  {C_FAINT}{ln}{C_RESET}")
+        elif ln.startswith("+"):
+            out.append(f"  {C_BRIGHT}{ln}{C_RESET}")
+        elif ln.startswith("-"):
+            out.append(f"  {C_DIM}{ln}{C_RESET}")
+        else:
+            out.append(f"  {C_FAINT}{ln}{C_RESET}")
+    if overflow:
+        out.append(f"  {C_DIM}… ({overflow} more line{'s' if overflow != 1 else ''}){C_RESET}")
+    return "\n".join(out)
+
+
+# ─────────────────────────────────────────────
+# Preflight — Ollama reachability + model availability
+# ─────────────────────────────────────────────
+
+def preflight_check(host: str, model: str) -> bool:
+    """
+    Verify Ollama is reachable and the requested model is pulled.
+    Prints a 2-line status and, if the model is missing, offers to
+    `ollama pull` it inline. Returns True if the agent is ready to run.
+    """
+    host = host.rstrip("/")
+    # 1. Reachability — hit /api/tags (cheap, lists models)
+    try:
+        req = urllib.request.Request(host + "/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"  {C_ERROR}✗{C_RESET} {C_MID}Ollama not reachable at {host}{C_RESET}")
+        print(f"    {C_DIM}{exc}{C_RESET}")
+        print(f"    {C_DIM}Start it with:{C_RESET} {C_BRIGHT}ollama serve{C_RESET}")
+        return False
+    print(f"  {C_BRIGHT}✓{C_RESET} {C_MID}Ollama reachable at {host}{C_RESET}")
+
+    # 2. Model availability
+    installed = [m["name"] for m in data.get("models", []) if "name" in m]
+    if model in installed:
+        print(f"  {C_BRIGHT}✓{C_RESET} {C_MID}Model {model} available{C_RESET}\n")
+        return True
+
+    print(f"  {C_ERROR}✗{C_RESET} {C_MID}Model {C_BRIGHT}{model}{C_RESET} {C_MID}not pulled{C_RESET}")
+    if not is_tty():
+        print(f"    {C_DIM}Pull it with:{C_RESET} {C_BRIGHT}ollama pull {model}{C_RESET}\n")
+        return False
+    try:
+        ans = input(f"    {C_DIM}Pull it now? [Y/n]{C_RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("")
+        return False
+    if ans in {"", "y", "yes"}:
+        print(f"    {C_DIM}running:{C_RESET} ollama pull {model}")
+        try:
+            r = subprocess.run(["ollama", "pull", model], check=False)
+        except FileNotFoundError:
+            print(f"    {C_ERROR}ollama CLI not found on PATH{C_RESET}\n")
+            return False
+        if r.returncode == 0:
+            print(f"  {C_BRIGHT}✓{C_RESET} {C_MID}Model {model} pulled{C_RESET}\n")
+            return True
+        print(f"    {C_ERROR}pull failed (exit {r.returncode}){C_RESET}\n")
+        return False
+    print(f"    {C_DIM}Pull it later with:{C_RESET} {C_BRIGHT}ollama pull {model}{C_RESET}\n")
+    return False
 
 
 # ─────────────────────────────────────────────
@@ -840,6 +929,13 @@ class NanoAgent:
             "history":        [],
             "memory":         {"task": "", "files": [], "notes": []},
         }
+        # Single-slot undo: captures pre-state of the last file-mutating tool.
+        # Shape: {"path": Path, "prev": str | None, "action": "write" | "patch"}
+        # prev is None when the file did not exist before the write.
+        self._undo_slot: dict | None = None
+        # Resets at the start of each ask(). When True, skip approval prompts
+        # for the rest of this turn (user answered 'a' to a previous prompt).
+        self._approve_all_turn: bool = False
         self.tools        = self._build_tools()
         self.session_path = self.session_store.save(self.session)
 
@@ -856,6 +952,8 @@ class NanoAgent:
         memory = self.session["memory"]
         if not memory["task"]:
             memory["task"] = clip(user_message.strip(), 300)
+        # Fresh approval decisions each turn — 'a' (approve-all) is turn-scoped.
+        self._approve_all_turn = False
 
         self._record({"role": "user", "content": user_message, "ts": now_iso()})
         self.renderer.start_turn()
@@ -925,7 +1023,30 @@ class NanoAgent:
     def reset(self) -> None:
         self.session["history"] = []
         self.session["memory"]  = {"task": "", "files": [], "notes": []}
+        self._undo_slot = None
         self.session_store.save(self.session)
+
+    def undo_last(self) -> str:
+        """Revert the last file-mutating tool call (write_file or patch_file)."""
+        slot = self._undo_slot
+        if not slot:
+            return "nothing to undo"
+        path: Path = slot["path"]
+        prev = slot["prev"]
+        rel = path.relative_to(self.root)
+        try:
+            if prev is None:
+                # File did not exist before — remove it.
+                if path.exists():
+                    path.unlink()
+                msg = f"reverted {slot['action']}: removed {rel} (did not exist before)"
+            else:
+                path.write_text(prev, encoding="utf-8")
+                msg = f"reverted {slot['action']}: restored {rel} ({len(prev)} chars)"
+        except OSError as exc:
+            return f"undo failed: {exc}"
+        self._undo_slot = None
+        return msg
 
     def memory_text(self) -> str:
         m     = self.session["memory"]
@@ -1164,17 +1285,62 @@ class NanoAgent:
     def _approve(self, name: str, args: dict) -> bool:
         if self.approval_policy == "auto":  return True
         if self.approval_policy == "never": return False
-        preview = json.dumps(args, ensure_ascii=False)[:120]
+        if self._approve_all_turn:          return True
+
+        # Render a preview appropriate for the tool.
+        preview = self._build_approval_preview(name, args)
+        if preview:
+            print(preview)
+
         try:
             ans = input(
-                f"\n  {C_INVERT} APPROVE {C_RESET} "
+                f"  {C_INVERT} APPROVE {C_RESET} "
                 f"{C_BOLD}{name}{C_RESET}  "
-                f"{C_DIM}{preview}{C_RESET}  "
-                f"{C_DIM}[y/N]{C_RESET} "
+                f"{C_DIM}[y=yes / n=no / a=yes to all this turn]{C_RESET} "
             )
         except EOFError:
             return False
-        return ans.strip().lower() in {"y", "yes"}
+        choice = ans.strip().lower()
+        if choice in {"a", "all"}:
+            self._approve_all_turn = True
+            return True
+        return choice in {"y", "yes"}
+
+    def _build_approval_preview(self, name: str, args: dict) -> str:
+        """
+        Return an ANSI-colored preview shown above the approval prompt.
+        Diffs for write_file / patch_file; command text for run_shell.
+        """
+        if name == "write_file" and args.get("path") and "content" in args:
+            try:
+                path = self._safe_path(args["path"])
+            except ValueError as exc:
+                return f"\n  {C_ERROR}{exc}{C_RESET}\n"
+            new = str(args["content"])
+            old = path.read_text(encoding="utf-8") if path.is_file() else ""
+            rel = path.relative_to(self.root) if path.is_absolute() else args["path"]
+            label = f"write_file {rel}" + ("" if old else "  (new file)")
+            return "\n" + _render_diff(old, new, label) + "\n"
+
+        if name == "patch_file" and args.get("path") and "new_text" in args:
+            try:
+                path = self._safe_path(args["path"])
+            except ValueError as exc:
+                return f"\n  {C_ERROR}{exc}{C_RESET}\n"
+            if not path.is_file():
+                return ""
+            old = path.read_text(encoding="utf-8")
+            new = old.replace(str(args.get("old_text", "")), str(args["new_text"]), 1)
+            rel = path.relative_to(self.root)
+            return "\n" + _render_diff(old, new, f"patch_file {rel}") + "\n"
+
+        if name == "run_shell" and args.get("command"):
+            cmd = str(args["command"]).strip()
+            return f"\n  {C_DIM}$ {C_RESET}{C_BRIGHT}{cmd}{C_RESET}\n"
+
+        # Fallback — compact JSON.
+        preview = json.dumps(args, ensure_ascii=False)[:200]
+        return f"\n  {C_DIM}{preview}{C_RESET}\n"
 
     def _safe_path(self, raw: str) -> Path:
         p = Path(raw)
@@ -1205,6 +1371,9 @@ class NanoAgent:
     def _tool_write_file(self, args: dict) -> str:
         path = self._safe_path(args["path"])
         content = str(args["content"])
+        # Capture pre-state for /undo before mutating anything.
+        prev = path.read_text(encoding="utf-8") if path.is_file() else None
+        self._undo_slot = {"path": path, "prev": prev, "action": "write"}
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         rel = path.relative_to(self.root)
@@ -1241,6 +1410,8 @@ class NanoAgent:
     def _tool_patch_file(self, args: dict) -> str:
         path = self._safe_path(args["path"])
         text = path.read_text(encoding="utf-8")
+        # Capture pre-state for /undo before mutating.
+        self._undo_slot = {"path": path, "prev": text, "action": "patch"}
         path.write_text(text.replace(str(args["old_text"]), str(args["new_text"]), 1),
                         encoding="utf-8")
         rel = path.relative_to(self.root)
@@ -1360,6 +1531,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--top-p",          type=float, default=DEFAULT_TOP_P)
     p.add_argument("--tool-set",       choices=("core", "full"), default="core")
     p.add_argument("--no-stream",      action="store_true", help="Disable live streaming.")
+    p.add_argument("--skip-preflight", action="store_true",
+                   help="Skip the Ollama + model availability check.")
     return p
 
 
@@ -1391,6 +1564,11 @@ def build_agent(args: argparse.Namespace, cwd: str,
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+
+    # Preflight: check Ollama + model before asking the user anything.
+    if not args.skip_preflight:
+        if not preflight_check(args.host, args.model):
+            return 1
 
     # Workspace: interactive picker unless --cwd given
     cwd = str(Path(args.cwd).expanduser().resolve()) if args.cwd else pick_workspace()
@@ -1443,6 +1621,9 @@ def main(argv: list[str] | None = None) -> int:
         if user_input == "/reset":
             agent.reset()
             print(f"  {C_DIM}Session cleared.{C_RESET}"); continue
+        if user_input == "/undo":
+            msg = agent.undo_last()
+            print(f"  {C_DIM}{msg}{C_RESET}"); continue
         if user_input == "/mode":
             new_policy = "auto" if agent.approval_policy == "ask" else "ask"
             agent.set_approval(new_policy)

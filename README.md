@@ -41,7 +41,7 @@ cd nano-coder
 python nano_coding_agent.py
 ```
 
-On startup, pick a workspace folder. Then just type a task.
+On startup, nano-coder runs a quick preflight — it checks that Ollama is reachable and that your model is pulled, and offers to pull it inline if it's missing. Then it prompts for a workspace folder.
 
 ```
 [20260417-14]  [ ASK ]  steps:5  nano-coder > write a fizzbuzz function
@@ -59,6 +59,7 @@ On startup, pick a workspace folder. Then just type a task.
 --tool-set core|full  4 tools or 6  (default: core)
 --resume latest     Resume last session
 --no-stream         Disable live token streaming
+--skip-preflight    Skip the startup Ollama + model check
 ```
 
 ---
@@ -71,9 +72,12 @@ On startup, pick a workspace folder. Then just type a task.
 /steps N    Set step limit  (e.g. /steps 10)
 /tools      List active tools
 /memory     Show session memory
+/undo       Revert the last file write or patch
 /reset      Clear session
 /exit       Quit
 ```
+
+In Ask mode, risky tool calls show a colored diff of the change before the approval prompt. Press `y` to accept, `n` to decline, or `a` to accept the rest of this turn.
 
 ---
 
